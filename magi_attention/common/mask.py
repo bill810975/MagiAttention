@@ -413,6 +413,63 @@ class AttnMask(nn.Module):
         dtype=torch.int32,
         device: str = "cpu",
     ) -> torch.Tensor:
+        """Generate a 2-D causal (auto-regressive) attention mask.
+
+        The mask is constructed by first building a ``max_seqlen × max_seqlen``
+        lower-triangular matrix (where ``max_seqlen = max(seqlen_q, seqlen_k)``),
+        then slicing it to ``(seqlen_q, seqlen_k)`` according to ``align``.
+
+        **Alignment modes**
+
+        * ``"bottom-right"`` (default) – the slice is anchored at the
+          bottom-right corner of the full triangular matrix.  This is the
+          standard alignment used by Flash-Attention and most LLM inference
+          frameworks.
+        * ``"top-left"`` – the slice is anchored at the top-left corner.
+
+        **Resulting mask shape by case (bottom-right)**
+
+        * ``seqlen_q == seqlen_k`` → standard lower-triangular matrix::
+
+                K: 0 1 2 3
+            Q0: [1 0 0 0]
+            Q1: [1 1 0 0]
+            Q2: [1 1 1 0]
+            Q3: [1 1 1 1]
+
+        * ``seqlen_q < seqlen_k`` → **trapezoidal** mask.  The first query
+          row already attends to ``(seqlen_k - seqlen_q + 1)`` key positions,
+          and each subsequent row adds one more::
+
+                K: 0 1 2 3 4 5 6       (seqlen_q=4, seqlen_k=7)
+            Q0: [1 1 1 1 0 0 0]   <- (7 - 4 + 1) = 4 keys
+            Q1: [1 1 1 1 1 0 0]
+            Q2: [1 1 1 1 1 1 0]
+            Q3: [1 1 1 1 1 1 1]
+
+        * ``seqlen_q > seqlen_k`` → the top rows are **fully masked** (all
+          zeros), followed by a triangular region::
+
+                K: 0 1 2 3             (seqlen_q=7, seqlen_k=4)
+            Q0: [0 0 0 0]
+            Q1: [0 0 0 0]
+            Q2: [0 0 0 0]
+            Q3: [1 0 0 0]
+            Q4: [1 1 0 0]
+            Q5: [1 1 1 0]
+            Q6: [1 1 1 1]
+
+        Args:
+            seqlen_q: Number of query positions (rows).
+            seqlen_k: Number of key positions (columns).
+            align: Alignment mode, either ``"bottom-right"`` or ``"top-left"``.
+            dtype: Data type of the returned tensor.
+            device: Device to place the tensor on.
+
+        Returns:
+            A ``(seqlen_q, seqlen_k)`` tensor with 1 for unmasked and
+            0 for masked positions.
+        """
         max_seqlen = max(seqlen_q, seqlen_k)
         causal_mask = torch.tril(torch.ones((max_seqlen, max_seqlen))).to(
             dtype=dtype, device=device
