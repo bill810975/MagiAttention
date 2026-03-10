@@ -413,6 +413,32 @@ class AttnMask(nn.Module):
         dtype=torch.int32,
         device: str = "cpu",
     ) -> torch.Tensor:
+        """Create a causal attention mask for the given Q and K sequence lengths.
+
+        When seqlen_q == seqlen_k, this produces a standard lower-triangular causal mask.
+
+        When seqlen_q < seqlen_k (Q shorter, K longer), this produces a **trapezoidal**
+        mask (not a full rectangle). With ``align="bottom-right"`` (the default), the
+        last query token can attend to all key tokens, while the first query token can
+        only attend to the first ``(seqlen_k - seqlen_q + 1)`` key tokens.
+
+        When seqlen_q > seqlen_k (Q longer, K shorter), with ``align="bottom-right"``,
+        the first ``(seqlen_q - seqlen_k)`` query rows have **no** attended key tokens,
+        and the remaining rows form a standard triangular causal mask.
+
+        Args:
+            seqlen_q: Length of the query sequence.
+            seqlen_k: Length of the key sequence.
+            align: Alignment mode. ``"bottom-right"`` aligns the last Q/K positions
+                (standard for KV-cache / prefill). ``"top-left"`` aligns the first
+                Q/K positions (standard for streaming / left-aligned contexts).
+            dtype: Data type of the output tensor.
+            device: Device of the output tensor.
+
+        Returns:
+            A ``[seqlen_q, seqlen_k]`` mask tensor where 1 indicates an attended
+            position and 0 indicates a masked position.
+        """
         max_seqlen = max(seqlen_q, seqlen_k)
         causal_mask = torch.tril(torch.ones((max_seqlen, max_seqlen))).to(
             dtype=dtype, device=device
