@@ -592,6 +592,143 @@ class TestAttnMask(TestCase):
 
         self.assertTrue(torch.equal(mask_br, ref_mask_br))
 
+    def test_dual_stream_block_causal_mask(self):
+        """Test the dual-stream block causal mask pattern.
+
+        Verifies that prefix attention uses FULL (not CAUSAL) so every query
+        in a block attends to all prefix keys. With CAUSAL and bottom-right
+        alignment, a trapezoidal mask would cause early queries to miss prefix
+        tokens when block_size < prefix_length.
+        """
+        seq_len = 8
+        mask_start_pos = 2
+        block_size = 3
+        n_blocks = 2
+        total_seqlen = 2 * seq_len
+
+        # ----- Build mask using FULL for prefix attention (correct) ----- #
+
+        q_range_list = []
+        k_range_list = []
+        attn_type_list = []
+
+        for block_id in range(n_blocks):
+            block_start = block_id * block_size + mask_start_pos
+            block_end = block_start + block_size
+            # Prefix attention: FULL so all queries see every prefix key
+            q_range_list.append((seq_len + block_start, seq_len + block_end))
+            k_range_list.append((0, block_start))
+            attn_type_list.append(AttnMaskType.FULL)
+            # Self-attention within block: CAUSAL
+            q_range_list.append((seq_len + block_start, seq_len + block_end))
+            k_range_list.append((seq_len + block_start, seq_len + block_end))
+            attn_type_list.append(AttnMaskType.CAUSAL)
+
+        q_ranges = AttnRanges.from_ranges(q_range_list)
+        k_ranges = AttnRanges.from_ranges(k_range_list)
+
+        correct_mask = AttnMask.from_ranges(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=attn_type_list,
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+        )
+
+        # With FULL prefix attention, every query in a block attends to all
+        # prefix keys. For block 0 (rows 10-12), prefix is k=[0,2) so rows
+        # 10-12 all see k=0 and k=1. For block 1 (rows 13-15), prefix is
+        # k=[0,5) so rows 13-15 all see k=0..4.
+        ref_correct = [
+            # col: 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 0
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 1
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 2
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 3
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 4
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 5
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 6
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 7
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 8
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 9
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],  # row 10
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],  # row 11
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0],  # row 12
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],  # row 13
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0],  # row 14
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1],  # row 15
+        ]
+
+        self.assertTrue(
+            np.equal(
+                correct_mask.mask_flag_array,
+                np.array(ref_correct),
+            ).all(),
+            "FULL prefix attention: every query in a block must see all prefix keys",
+        )
+
+        # ----- Build mask using CAUSAL for prefix attention (buggy) ----- #
+
+        buggy_attn_type_list = []
+        for block_id in range(n_blocks):
+            buggy_attn_type_list.append(AttnMaskType.CAUSAL)  # BUG: should be FULL
+            buggy_attn_type_list.append(AttnMaskType.CAUSAL)
+
+        buggy_mask = AttnMask.from_ranges(
+            q_ranges=q_ranges,
+            k_ranges=k_ranges,
+            attn_mask_type=buggy_attn_type_list,
+            total_seqlen_q=total_seqlen,
+            total_seqlen_k=total_seqlen,
+        )
+
+        # With CAUSAL prefix attention, the bottom-right aligned trapezoidal
+        # mask causes row 10 to miss all prefix tokens, and row 13 to see
+        # only 3 of 5 prefix tokens.
+        ref_buggy = [
+            # col: 0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 0
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 1
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 2
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 3
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 4
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 5
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 6
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 7
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 8
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  # row 9
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0],  # row 10: no prefix!
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],  # row 11: only k=0
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0],  # row 12: k=0,1
+            [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],  # row 13: only k=0..2
+            [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0],  # row 14: only k=0..3
+            [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1],  # row 15: k=0..4
+        ]
+
+        self.assertTrue(
+            np.equal(
+                buggy_mask.mask_flag_array,
+                np.array(ref_buggy),
+            ).all(),
+            "CAUSAL prefix attention produces trapezoidal mask (incorrect)",
+        )
+
+        # Verify the masks are different: CAUSAL drops prefix tokens
+        self.assertFalse(
+            np.equal(
+                correct_mask.mask_flag_array,
+                buggy_mask.mask_flag_array,
+            ).all(),
+            "FULL and CAUSAL prefix masks must differ",
+        )
+
+        # The correct mask has strictly more unmasked tokens than the buggy one
+        self.assertGreater(
+            correct_mask.area,
+            buggy_mask.area,
+            "FULL prefix mask must have more unmasked tokens than CAUSAL",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
