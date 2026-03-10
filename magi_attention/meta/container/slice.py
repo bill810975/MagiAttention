@@ -126,7 +126,7 @@ class MultiKAttnSlice:
                         self._area += (1 + k_range.seqlen) * k_range.seqlen // 2
                 elif mask_type == AttnMaskType.BICAUSAL:
                     # the area of a parallelogram
-                    self._area = (
+                    self._area += (
                         k_range.seqlen - self.q_range.seqlen + 1
                     ) * self.q_range.seqlen
                 else:
