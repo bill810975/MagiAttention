@@ -30,6 +30,7 @@ class FlashMaskType(Enum):
     SLIDING_WINDOW_CAUSAL = "sliding_window_causal"
     GLOBAL_SLIDING_WINDOW = "global_sliding_window"
     BLOCK_CAUSAL_DOCUMENT = "block_causal_document"
+    DUAL_STREAM_BLOCK_CAUSAL = "dual_stream_block_causal"
 
 
 class MetricsType(Enum):

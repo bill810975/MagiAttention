@@ -98,6 +98,7 @@ class MaskIterator:
             FlashMaskType.SLIDING_WINDOW_CAUSAL: self.generate_sliding_window_causal_mask,
             FlashMaskType.GLOBAL_SLIDING_WINDOW: self.generate_global_sliding_window_mask,
             FlashMaskType.BLOCK_CAUSAL_DOCUMENT: self.generate_block_causal_document_mask,
+            FlashMaskType.DUAL_STREAM_BLOCK_CAUSAL: self.generate_dual_stream_block_causal_mask,
         }
 
     def generate(self):
@@ -435,6 +436,70 @@ class MaskIterator:
         mask_factors = MaskFactors(
             cu_seqlens=cu_seqlens,
             cu_ranges=cu_ranges,
+            block_size=self.block_size,
+        )
+
+        return q_ranges, k_ranges, attn_type_map, mask_factors
+
+    def generate_dual_stream_block_causal_mask(
+        self,
+    ) -> tuple[list[list[int]], list[list[int]], list[int], MaskFactors]:
+        """generate DUAL STREAM BLOCK CAUSAL mask
+
+        Creates a mask for a dual-stream architecture (clean stream + noisy stream).
+        The total sequence length is 2 * seq_len, where:
+          - [0, seq_len) is the clean stream
+          - [seq_len, 2*seq_len) is the noisy stream
+
+        The mask has three parts:
+          Step 1: Clean stream with causal self-attention
+          Step 2: Noisy prefix with full self-attention (tokens before mask_start_pos)
+          Step 3: Each noisy block fully attends to the corresponding prefix in the
+                  clean stream, plus causal self-attention within the block.
+
+        Note: Step 3 uses FULL (not CAUSAL) for prefix attention so that every
+        query in a block can attend to all prefix keys. Using CAUSAL would create
+        a trapezoidal mask when block_size < prefix_length, causing early queries
+        to miss prefix tokens.
+        """
+        assert self.block_size is not None, "block_size must be set"
+        seq_len = self.total_seqlen // 2
+        mask_start_pos = (
+            self.prefix_length if self.prefix_length else seq_len // 4
+        )
+        n_blocks = (seq_len - mask_start_pos) // self.block_size
+
+        q_ranges: list[list[int]] = []
+        k_ranges: list[list[int]] = []
+        attn_type_map: list[int] = []
+
+        # Step 1 (Clean): Clean stream with causal self-attention
+        q_ranges.append([0, seq_len])
+        k_ranges.append([0, seq_len])
+        attn_type_map.append(1)  # CAUSAL
+
+        # Step 2 (Prefix): Noisy prefix attends to clean prefix (full)
+        if mask_start_pos > 0:
+            q_ranges.append([seq_len, seq_len + mask_start_pos])
+            k_ranges.append([0, mask_start_pos])
+            attn_type_map.append(0)  # FULL
+
+        # Step 3 (Flex): Each block attends to corresponding prefix in clean
+        #   stream (FULL), plus causal self-attention inside current block
+        for block_id in range(n_blocks):
+            block_start = block_id * self.block_size + mask_start_pos
+            block_end = block_start + self.block_size
+            # Prefix attention: FULL so all queries see the entire prefix
+            q_ranges.append([seq_len + block_start, seq_len + block_end])
+            k_ranges.append([0, block_start])
+            attn_type_map.append(0)  # FULL
+            # Self-attention within the block: CAUSAL
+            q_ranges.append([seq_len + block_start, seq_len + block_end])
+            k_ranges.append([seq_len + block_start, seq_len + block_end])
+            attn_type_map.append(1)  # CAUSAL
+
+        mask_factors = MaskFactors(
+            prefix_length=mask_start_pos,
             block_size=self.block_size,
         )
 
